@@ -739,7 +739,8 @@ pub enum ImageCacheError {
     #[error("image error: {0}")]
     Image(Arc<ImageError>),
     /// An error that occurred while processing an SVG.
-        #[error("svg error: {0}")]
+    #[cfg(feature = "svg")]
+    #[error("svg error: {0}")]
     Usvg(Arc<usvg::Error>),
 }
 
@@ -755,6 +756,7 @@ impl From<io::Error> for ImageCacheError {
     }
 }
 
+#[cfg(feature = "svg")]
 impl From<usvg::Error> for ImageCacheError {
     fn from(value: usvg::Error) -> Self {
         Self::Usvg(Arc::new(value))

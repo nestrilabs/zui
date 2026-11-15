@@ -12,8 +12,9 @@ workspace = true
 path = "src/gpui_platform.rs"
 
 [features]
-default = ["wayland", "x11", "portals", "keyring", "a11y", "notifications"]
-font-kit = ["gpui_macos/font-kit"]
+default = ["wayland", "x11", "portals", "keyring", "a11y", "notifications", "svg"]
+font-kit = ["gpui_macos/font-kit", "gpui/font-kit"]
+svg = ["gpui/svg"]
 test-support = ["gpui/test-support", "gpui_macos/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
@@ -25,7 +26,7 @@ notifications = ["gpui_linux/notifications"]
 x11 = ["gpui_linux/x11"]
 
 [dependencies]
-gpui.workspace = true
+gpui = { workspace = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos.workspace = true

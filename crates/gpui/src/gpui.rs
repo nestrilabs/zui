@@ -50,6 +50,10 @@ mod shared_uri;
 mod style;
 mod styled;
 mod subscription;
+#[cfg(feature = "svg")]
+mod svg_renderer;
+#[cfg(not(feature = "svg"))]
+#[path = "svg_renderer_off.rs"]
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
