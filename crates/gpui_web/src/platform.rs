@@ -315,6 +315,20 @@ impl Platform for WebPlatform {
             CursorStyle::DragLink => "alias",
             CursorStyle::DragCopy => "copy",
             CursorStyle::ContextualMenu => "context-menu",
+            CursorStyle::Wait => "wait",
+            CursorStyle::Progress => "progress",
+            CursorStyle::Help => "help",
+            CursorStyle::Cell => "cell",
+            CursorStyle::Move => "move",
+            CursorStyle::ZoomIn => "zoom-in",
+            CursorStyle::ZoomOut => "zoom-out",
+            CursorStyle::ResizeUpLeft => "nw-resize",
+            CursorStyle::ResizeUpRight => "ne-resize",
+            CursorStyle::ResizeDownLeft => "sw-resize",
+            CursorStyle::ResizeDownRight => "se-resize",
+            CursorStyle::None => "none",
+            // Custom images are not drawn on the web yet.
+            CursorStyle::Custom(_) => "default",
         };
 
         self.last_cursor_css.set(css_cursor);

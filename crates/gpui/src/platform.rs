@@ -287,6 +287,11 @@ pub trait Platform: 'static {
 
     fn set_cursor_style(&self, style: CursorStyle);
 
+    /// Holds `image` as the custom cursor `id`, or forgets it when `image` is `None`. A window
+    /// whose cursor is `CursorStyle::Custom(id)` shows the new image at once. Platforms without
+    /// custom cursors ignore it and show the arrow.
+    fn set_custom_cursor(&self, _id: CustomCursorId, _image: Option<CustomCursorImage>) {}
+
     /// Hides the mouse cursor until the user moves the mouse over one of
     /// this application's windows.
     fn hide_cursor_until_mouse_moves(&self);
@@ -2256,6 +2261,119 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// A busy cursor: the program is busy and input is not taken
+    /// corresponds to the CSS cursor value `wait`
+    Wait,
+
+    /// A busy cursor that still takes input
+    /// corresponds to the CSS cursor value `progress`
+    Progress,
+
+    /// A help cursor
+    /// corresponds to the CSS cursor value `help`
+    Help,
+
+    /// A cell or set of cells may be selected
+    /// corresponds to the CSS cursor value `cell`
+    Cell,
+
+    /// Something is to be moved
+    /// corresponds to the CSS cursor value `move`
+    Move,
+
+    /// Something can be zoomed in
+    /// corresponds to the CSS cursor value `zoom-in`
+    ZoomIn,
+
+    /// Something can be zoomed out
+    /// corresponds to the CSS cursor value `zoom-out`
+    ZoomOut,
+
+    /// A resize cursor for the top-left corner
+    /// corresponds to the CSS cursor value `nw-resize`
+    ResizeUpLeft,
+
+    /// A resize cursor for the top-right corner
+    /// corresponds to the CSS cursor value `ne-resize`
+    ResizeUpRight,
+
+    /// A resize cursor for the bottom-left corner
+    /// corresponds to the CSS cursor value `sw-resize`
+    ResizeDownLeft,
+
+    /// A resize cursor for the bottom-right corner
+    /// corresponds to the CSS cursor value `se-resize`
+    ResizeDownRight,
+
+    /// No cursor: the pointer is invisible while this style applies
+    /// corresponds to the CSS cursor value `none`
+    None,
+
+    /// An image registered with `App::set_custom_cursor`, by its ID. Until an image is held
+    /// for the ID, the arrow is shown. Platforms without custom cursors show the arrow.
+    Custom(CustomCursorId),
+}
+
+/// The ID of a custom cursor image (see `App::set_custom_cursor`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CustomCursorId(pub u64);
+
+/// A custom cursor image: premultiplied RGBA8, row by row, `width * height * 4` bytes, and the
+/// hotspot in image pixels. The image is shown pixel for pixel, at no scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomCursorImage {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// The hotspot, from the left.
+    pub hotspot_x: u32,
+    /// The hotspot, from the top.
+    pub hotspot_y: u32,
+    /// Premultiplied RGBA8.
+    pub rgba: Vec<u8>,
+}
+
+impl CustomCursorImage {
+    /// Checks the size and the hotspot. The error names the check that failed.
+    pub fn check(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.width > 0 && self.height > 0,
+            "empty cursor image {}x{}",
+            self.width,
+            self.height
+        );
+        anyhow::ensure!(
+            self.rgba.len() as u64 == u64::from(self.width) * u64::from(self.height) * 4,
+            "cursor image {}x{} has {} bytes",
+            self.width,
+            self.height,
+            self.rgba.len()
+        );
+        anyhow::ensure!(
+            self.hotspot_x < self.width && self.hotspot_y < self.height,
+            "cursor hotspot ({}, {}) outside {}x{}",
+            self.hotspot_x,
+            self.hotspot_y,
+            self.width,
+            self.height
+        );
+        Ok(())
+    }
+
+    /// The pixels as premultiplied BGRA8 (X11 RENDER ARGB32 and `wl_shm` ARGB8888 on a
+    /// little-endian machine).
+    pub fn to_bgra_premultiplied(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.rgba.len());
+        for px in self.rgba.chunks_exact(4) {
+            // A premultiplied colour is never above its alpha; clamp a bad one so the server
+            // never sees an out-of-range pixel.
+            let a = px[3];
+            out.extend_from_slice(&[px[2].min(a), px[1].min(a), px[0].min(a), a]);
+        }
+        out
+    }
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -2905,5 +3023,49 @@ mod tests {
     #[test]
     fn test_window_button_layout_parse_all_invalid() {
         assert!(WindowButtonLayout::parse("asdfghjkl").is_err());
+    }
+}
+
+#[cfg(test)]
+mod custom_cursor_tests {
+    use super::CustomCursorImage;
+
+    fn image(width: u32, height: u32, hotspot: (u32, u32), rgba: Vec<u8>) -> CustomCursorImage {
+        CustomCursorImage {
+            width,
+            height,
+            hotspot_x: hotspot.0,
+            hotspot_y: hotspot.1,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn premultiplied_rgba_becomes_bgra_unchanged_in_value() {
+        // Opaque red, half-transparent premultiplied green, transparent.
+        let img = image(
+            3,
+            1,
+            (0, 0),
+            vec![255, 0, 0, 255, 0, 128, 0, 128, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            img.to_bgra_premultiplied(),
+            vec![0, 0, 255, 255, 0, 128, 0, 128, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_colour_above_its_alpha_is_clamped() {
+        let img = image(1, 1, (0, 0), vec![200, 10, 90, 100]);
+        assert_eq!(img.to_bgra_premultiplied(), vec![90, 10, 100, 100]);
+    }
+
+    #[test]
+    fn check_names_bad_size_and_hotspot() {
+        assert!(image(2, 2, (1, 1), vec![0; 16]).check().is_ok());
+        assert!(image(2, 2, (2, 0), vec![0; 16]).check().is_err());
+        assert!(image(2, 2, (0, 0), vec![0; 15]).check().is_err());
+        assert!(image(0, 2, (0, 0), vec![]).check().is_err());
     }
 }

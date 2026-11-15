@@ -94,12 +94,12 @@ use crate::linux::{
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, FileDropEvent,
-    ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, profiler, px, size,
+    AnyWindowHandle, Bounds, Capslock, CursorStyle, CustomCursorId, CustomCursorImage,
+    DevicePixels, DisplayId, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
+    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -347,6 +347,8 @@ pub(crate) struct WaylandClientState {
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
+    /// Custom cursor images in shm buffers (`CursorStyle::Custom`).
+    custom_cursors: HashMap<CustomCursorId, CustomCursorBuffer>,
     clipboard: Clipboard,
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -551,31 +553,147 @@ impl WaylandClientState {
             return;
         };
         let serial = self.serial_tracker.get(SerialKind::MouseEnter);
+        self.show_cursor_style(serial, style);
+    }
+
+    /// Shows `style` on the pointer. A hidden or custom cursor is set without the shape device,
+    /// which has neither; a custom cursor whose image is not held yet shows the arrow.
+    fn show_cursor_style(&mut self, serial: u32, style: CursorStyle) {
+        let wl_pointer = self.wl_pointer.clone();
+        match style {
+            CursorStyle::None => {
+                if let Some(wl_pointer) = &wl_pointer {
+                    wl_pointer.set_cursor(serial, None, 0, 0);
+                    log::debug!("wayland: hidden cursor set");
+                }
+                return;
+            }
+            CursorStyle::Custom(id) => {
+                if let (Some(wl_pointer), Some(custom)) =
+                    (&wl_pointer, self.custom_cursors.get(&id))
+                {
+                    self.cursor.set_custom(wl_pointer, serial, custom);
+                    log::debug!("wayland: custom cursor {} set", id.0);
+                    return;
+                }
+                log::debug!("wayland: custom cursor {} not held yet, arrow set", id.0);
+            }
+            _ => {}
+        }
+        let style = match style {
+            CursorStyle::Custom(_) => CursorStyle::Arrow,
+            style => style,
+        };
         if let Some(cursor_shape_device) = &self.cursor_shape_device {
             cursor_shape_device.set_shape(serial, to_shape(style));
             return;
         }
-        let Some(focused_window) = self.mouse_focused_window.clone() else {
-            log::warn!(
-                "wayland: no focused surface to restore cursor style {:?} after hide; cursor may stay invisible",
-                style
-            );
+        let Some(scale) = self
+            .mouse_focused_window
+            .as_ref()
+            .map(|w| w.primary_output_scale())
+        else {
             return;
         };
-        let Some(wl_pointer) = self.wl_pointer.clone() else {
-            log::warn!(
-                "wayland: no wl_pointer to restore cursor style {:?} after hide; cursor may stay invisible",
-                style
-            );
+        let Some(wl_pointer) = wl_pointer else {
             return;
         };
-        let scale = focused_window.primary_output_scale();
         self.cursor.set_icon(
             &wl_pointer,
             serial,
             cursor_style_to_icon_names(style),
             scale,
         );
+    }
+
+    /// Holds or forgets the custom cursor `id`. The pointer shows the new image at once when
+    /// that cursor is the current one.
+    fn set_custom_cursor(&mut self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        let new = match image {
+            Some(image) => match image
+                .check()
+                .and_then(|()| CustomCursorBuffer::new(&self.globals.shm, &self.globals.qh, &image))
+            {
+                Ok(buffer) => {
+                    log::debug!(
+                        "wayland: custom cursor {} held: {}x{} hotspot ({}, {})",
+                        id.0,
+                        image.width,
+                        image.height,
+                        image.hotspot_x,
+                        image.hotspot_y
+                    );
+                    Some(buffer)
+                }
+                Err(err) => {
+                    log::warn!("wayland: custom cursor {} not made: {err:#}", id.0);
+                    None
+                }
+            },
+            None => None,
+        };
+        let old = match new {
+            Some(buffer) => self.custom_cursors.insert(id, buffer),
+            None => self.custom_cursors.remove(&id),
+        };
+        if self.cursor_style == Some(CursorStyle::Custom(id))
+            && self.cursor_hidden_window.is_none()
+            && self.mouse_focused_window.is_some()
+        {
+            let serial = self.serial_tracker.get(SerialKind::MouseEnter);
+            self.show_cursor_style(serial, CursorStyle::Custom(id));
+        }
+        if let Some(old) = old {
+            old.buffer.destroy();
+        }
+    }
+}
+
+/// A custom cursor image in its own shm buffer.
+pub(crate) struct CustomCursorBuffer {
+    pub buffer: wl_buffer::WlBuffer,
+    pub width: i32,
+    pub height: i32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+}
+
+impl CustomCursorBuffer {
+    fn new(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<WaylandClientStatePtr>,
+        image: &CustomCursorImage,
+    ) -> anyhow::Result<Self> {
+        use std::io::Write as _;
+        use std::os::fd::{AsFd as _, FromRawFd as _};
+        let pixels = image.to_bgra_premultiplied();
+        let width = i32::try_from(image.width)?;
+        let height = i32::try_from(image.height)?;
+        let len = i32::try_from(pixels.len())?;
+        // SAFETY: the name is a valid C string; the returned fd is owned by `file` below.
+        let fd = unsafe { libc::memfd_create(c"gpui-cursor".as_ptr(), libc::MFD_CLOEXEC) };
+        anyhow::ensure!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        // SAFETY: `fd` is a fresh, open file descriptor nothing else owns.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(&pixels)?;
+        let pool = shm.create_pool(file.as_fd(), len, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width,
+            height,
+            width * 4,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        pool.destroy();
+        Ok(Self {
+            buffer,
+            width,
+            height,
+            hotspot_x: i32::try_from(image.hotspot_x)?,
+            hotspot_y: i32::try_from(image.hotspot_y)?,
+        })
     }
 }
 
@@ -840,6 +958,7 @@ impl WaylandClient {
             enter_token: None,
             cursor_style: None,
             cursor_hidden_window: None,
+            custom_cursors: HashMap::default(),
             clipboard: Clipboard::new(conn.clone(), handle.clone()),
             data_offers: Vec::new(),
             primary_data_offer: None,
@@ -1002,22 +1121,11 @@ impl LinuxClient for WaylandClient {
         }
 
         let serial = state.serial_tracker.get(SerialKind::MouseEnter);
-        if let Some(cursor_shape_device) = &state.cursor_shape_device {
-            cursor_shape_device.set_shape(serial, to_shape(style));
-        } else if let Some(focused_window) = &state.mouse_focused_window {
-            // cursor-shape-v1 isn't supported, set the cursor using a surface.
-            let wl_pointer = state
-                .wl_pointer
-                .clone()
-                .expect("window is focused by pointer");
-            let scale = focused_window.primary_output_scale();
-            state.cursor.set_icon(
-                &wl_pointer,
-                serial,
-                cursor_style_to_icon_names(style),
-                scale,
-            );
-        }
+        state.show_cursor_style(serial, style);
+    }
+
+    fn set_custom_cursor(&self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        self.0.borrow_mut().set_custom_cursor(id, image);
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
@@ -1940,7 +2048,7 @@ fn linux_button_to_gpui(button: u32) -> Option<MouseButton> {
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        wl_pointer: &wl_pointer::WlPointer,
+        _wl_pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -1970,17 +2078,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     state.restore_cursor_after_hide();
                     if let Some(style) = state.cursor_style {
-                        if let Some(cursor_shape_device) = &state.cursor_shape_device {
-                            cursor_shape_device.set_shape(serial, to_shape(style));
-                        } else {
-                            let scale = window.primary_output_scale();
-                            state.cursor.set_icon(
-                                wl_pointer,
-                                serial,
-                                cursor_style_to_icon_names(style),
-                                scale,
-                            );
-                        }
+                        state.show_cursor_style(serial, style);
                     }
                     let modifiers = state.modifiers;
                     drop(state);

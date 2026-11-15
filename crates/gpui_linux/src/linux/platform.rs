@@ -22,11 +22,11 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowButtonLayout, WindowParams,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, CustomCursorId,
+    CustomCursorImage, DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Result, RunnableVariant, Task, ThermalState,
+    WindowAppearance, WindowButtonLayout, WindowParams,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use gpui::{Pixels, Point, px};
@@ -79,6 +79,7 @@ pub(crate) trait LinuxClient {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
     fn set_cursor_style(&self, style: CursorStyle);
+    fn set_custom_cursor(&self, _id: CustomCursorId, _image: Option<CustomCursorImage>) {}
     fn hide_cursor_until_mouse_moves(&self) {}
     fn is_cursor_visible(&self) -> bool {
         true
@@ -637,6 +638,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         self.inner.set_cursor_style(style)
     }
 
+    fn set_custom_cursor(&self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        self.inner.set_custom_cursor(id, image)
+    }
+
     fn hide_cursor_until_mouse_moves(&self) {
         self.inner.hide_cursor_until_mouse_moves()
     }
@@ -923,6 +928,19 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        CursorStyle::Wait => &["wait", "watch"],
+        CursorStyle::Progress => &["progress", "left_ptr_watch"],
+        CursorStyle::Help => &["help", "question_arrow"],
+        CursorStyle::Cell => &["cell", "plus"],
+        CursorStyle::Move => &["move", "fleur"],
+        CursorStyle::ZoomIn => &["zoom-in"],
+        CursorStyle::ZoomOut => &["zoom-out"],
+        CursorStyle::ResizeUpLeft => &["nw-resize", "top_left_corner"],
+        CursorStyle::ResizeUpRight => &["ne-resize", "top_right_corner"],
+        CursorStyle::ResizeDownLeft => &["sw-resize", "bottom_left_corner"],
+        CursorStyle::ResizeDownRight => &["se-resize", "bottom_right_corner"],
+        // Not theme cursors: the backends draw these themselves. The arrow is the fallback.
+        CursorStyle::None | CursorStyle::Custom(_) => &[DEFAULT_CURSOR_ICON_NAME],
     }
 }
 

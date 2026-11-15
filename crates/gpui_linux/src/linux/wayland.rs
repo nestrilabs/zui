@@ -38,5 +38,19 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+        CursorStyle::Wait => Shape::Wait,
+        CursorStyle::Progress => Shape::Progress,
+        CursorStyle::Help => Shape::Help,
+        CursorStyle::Cell => Shape::Cell,
+        CursorStyle::Move => Shape::Move,
+        CursorStyle::ZoomIn => Shape::ZoomIn,
+        CursorStyle::ZoomOut => Shape::ZoomOut,
+        CursorStyle::ResizeUpLeft => Shape::NwResize,
+        CursorStyle::ResizeUpRight => Shape::NeResize,
+        CursorStyle::ResizeDownLeft => Shape::SwResize,
+        CursorStyle::ResizeDownRight => Shape::SeResize,
+        // Not shapes: the client draws these without the shape device. The arrow is the
+        // fallback.
+        CursorStyle::None | CursorStyle::Custom(_) => Shape::Default,
     }
 }

@@ -2378,6 +2378,22 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::Move => msg_send![class!(NSCursor), closedHandCursor],
+            CursorStyle::ResizeUpLeft | CursorStyle::ResizeDownRight => {
+                msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
+            }
+            CursorStyle::ResizeUpRight | CursorStyle::ResizeDownLeft => {
+                msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
+            }
+            // No AppKit cursor for these, no hidden or custom cursor here yet: the arrow.
+            CursorStyle::Wait
+            | CursorStyle::Progress
+            | CursorStyle::Help
+            | CursorStyle::Cell
+            | CursorStyle::ZoomIn
+            | CursorStyle::ZoomOut
+            | CursorStyle::None
+            | CursorStyle::Custom(_) => msg_send![class!(NSCursor), arrowCursor],
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
