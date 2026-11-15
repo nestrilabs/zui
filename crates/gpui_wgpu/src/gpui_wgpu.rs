@@ -13,6 +13,30 @@ pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(test)]
 mod shader_tests {
     #[test]
+    fn video_shader_validates_and_matches_host_layout() {
+        let module = naga::front::wgsl::parse_str(include_str!("shaders_video.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let ty = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("VideoInstance"))
+            .unwrap()
+            .1;
+        let naga::TypeInner::Struct { span, .. } = &ty.inner else {
+            panic!("expected struct")
+        };
+        assert_eq!(
+            *span as usize,
+            std::mem::size_of::<crate::wgpu_renderer::VideoInstance>()
+        );
+    }
+
+    #[test]
     fn image_alpha_mask_shader_validates_and_matches_host_layout() {
         use std::mem::{offset_of, size_of};
         let module = naga::front::wgsl::parse_str(include_str!("shaders.wgsl")).unwrap();

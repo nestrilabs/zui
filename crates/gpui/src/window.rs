@@ -4680,7 +4680,87 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+            video: None,
         });
+    }
+
+    /// Paint a video quad: the `params.crop` part of `source`'s newest picture, drawn into
+    /// `bounds` with rounded corners, opacity and `params.transform` about the centre of `bounds`.
+    /// Many calls in one frame may draw different crops of the same source; its picture is
+    /// uploaded once per new generation into persistent textures.
+    ///
+    /// Drawn by the Linux/FreeBSD wgpu renderer. Other renderers draw nothing yet. Nothing is
+    /// drawn until the source has a picture.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_video(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: &std::sync::Arc<crate::VideoSource>,
+        params: crate::VideoParams,
+    ) {
+        use crate::{PaintSurface, VideoQuad};
+
+        self.invalidator.debug_assert_paint();
+        #[cfg(target_os = "macos")]
+        {
+            // The Metal surface path needs a CVPixelBuffer; NV12-from-memory is not wired there.
+            let _ = (bounds, source, params);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if source.size().is_none() {
+                return;
+            }
+            let scale = self.scale_factor();
+            let quad_bounds = bounds.scale(scale);
+            let transform = params.transform;
+            // The screen-space box of the transformed quad, for ordering and culling.
+            let half_w = f32::from(bounds.size.width) / 2.0;
+            let half_h = f32::from(bounds.size.height) / 2.0;
+            let center_x = f32::from(bounds.origin.x) + half_w;
+            let center_y = f32::from(bounds.origin.y) + half_h;
+            let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for corner in [
+                (-half_w, -half_h),
+                (half_w, -half_h),
+                (-half_w, half_h),
+                (half_w, half_h),
+            ] {
+                let ((x, y), _) = transform.project(corner);
+                min_x = min_x.min(center_x + x);
+                min_y = min_y.min(center_y + y);
+                max_x = max_x.max(center_x + x);
+                max_y = max_y.max(center_y + y);
+            }
+            let screen_bounds = Bounds::from_corners(
+                point(px(min_x.floor()), px(min_y.floor())),
+                point(px(max_x.ceil()), px(max_y.ceil())),
+            )
+            .scale(scale);
+            let content_mask = self.snapped_content_mask();
+            let opacity = self.element_opacity() * params.opacity.clamp(0.0, 1.0);
+            self.next_frame.scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds: screen_bounds,
+                content_mask,
+                video: Some(VideoQuad {
+                    source: source.clone(),
+                    quad_bounds,
+                    crop: params.crop,
+                    corner_radius: f32::from(params.corner_radius) * scale,
+                    opacity,
+                    scale: transform.scale,
+                    translate: (
+                        f32::from(transform.translate.x) * scale,
+                        f32::from(transform.translate.y) * scale,
+                    ),
+                    rotate_y: transform.rotate_y.0,
+                    perspective: f32::from(transform.perspective) * scale,
+                }),
+            });
+        }
     }
 
     /// Removes an image from the sprite atlas.

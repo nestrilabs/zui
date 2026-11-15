@@ -947,6 +947,8 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// A video quad (`Window::paint_video`). Renderers without video support skip it.
+    pub video: Option<crate::VideoQuad>,
 }
 
 impl From<PaintSurface> for Primitive {

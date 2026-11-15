@@ -57,6 +57,7 @@ mod taffy;
 pub mod test;
 mod text_system;
 mod util;
+mod video;
 mod view;
 mod window;
 
@@ -156,6 +157,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 pub use test::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
+pub use video::*;
 pub use view::*;
 pub use window::*;
 
