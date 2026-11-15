@@ -285,7 +285,7 @@ pub struct X11WindowState {
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
-    accesskit_adapter: Option<accesskit_unix::Adapter>,
+    accesskit_adapter: Option<crate::linux::a11y::Adapter>,
 }
 
 impl X11WindowState {
@@ -1939,7 +1939,7 @@ impl PlatformWindow for X11Window {
         };
 
         let adapter =
-            accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+            crate::linux::a11y::Adapter::new(activation_handler, action_handler, deactivation_handler);
 
         self.0.state.borrow_mut().accesskit_adapter = Some(adapter);
     }

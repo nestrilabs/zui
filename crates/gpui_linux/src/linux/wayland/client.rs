@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "portals")]
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
@@ -91,8 +92,9 @@ use crate::linux::{
         to_shape,
         window::WaylandWindow,
     },
-    xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
+#[cfg(feature = "portals")]
+use crate::linux::xdg_desktop_portal::{Event as XDPEvent, XDPEventSource};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
@@ -728,6 +730,7 @@ impl WaylandClient {
 
         let cursor = Cursor::new(&conn, &globals, 24);
 
+        #[cfg(feature = "portals")]
         handle
             .insert_source(XDPEventSource::new(&common.background_executor), {
                 move |event, _, client| match event {
@@ -1149,6 +1152,7 @@ impl LinuxClient for WaylandClient {
         "Wayland"
     }
 
+    #[cfg(feature = "portals")]
     fn window_identifier(&self) -> impl Future<Output = Option<WindowIdentifier>> + Send + 'static {
         async fn inner(surface: Option<wl_surface::WlSurface>) -> Option<WindowIdentifier> {
             if let Some(surface) = surface {

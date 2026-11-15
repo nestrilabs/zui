@@ -1,4 +1,5 @@
 use anyhow::{Context as _, anyhow};
+#[cfg(feature = "portals")]
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle, RegistrationToken,
@@ -54,8 +55,9 @@ use crate::linux::{
     keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
-    xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
+#[cfg(feature = "portals")]
+use crate::linux::xdg_desktop_portal::{Event as XDPEvent, XDPEventSource};
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
@@ -482,6 +484,7 @@ impl X11Client {
             )
             .map_err(|err| anyhow!("Failed to initialize X11 event source: {err:?}"))?;
 
+        #[cfg(feature = "portals")]
         handle
             .insert_source(XDPEventSource::new(&common.background_executor), {
                 move |event, _, client| match event {
@@ -1865,6 +1868,7 @@ impl LinuxClient for X11Client {
         Some(handles)
     }
 
+    #[cfg(feature = "portals")]
     fn window_identifier(&self) -> impl Future<Output = Option<WindowIdentifier>> + Send + 'static {
         let state = self.0.borrow();
         state

@@ -12,12 +12,12 @@ workspace = true
 path = "src/gpui_linux.rs"
 
 [features]
-default = ["wayland", "x11"]
+default = ["wayland", "x11", "portals", "keyring", "a11y", "notifications"]
 test-support = ["gpui/test-support"]
 wayland = [
     "bitflags",
     "gpui_wgpu",
-    "ashpd/wayland",
+    "ashpd?/wayland",
 
     "calloop-wayland-source",
     "wayland-backend",
@@ -33,7 +33,6 @@ wayland = [
 ]
 x11 = [
     "gpui_wgpu",
-    "ashpd",
 
     "as-raw-xcb-connection",
     "x11rb",
@@ -48,11 +47,20 @@ screen-capture = [
     "gpui/screen-capture",
     "scap",
 ]
+# xdg-desktop-portal (ashpd, zbus): file dialogs, open-uri, reveal, appearance, WindowIdentifier,
+# logind wake. Without it those calls are no-ops or report the portal as missing.
+portals = ["dep:ashpd"]
+# Secret Service keyring (oo7): write/read/delete_credentials.
+keyring = ["dep:oo7"]
+# AccessKit adapter for assistive technology (accesskit_unix).
+# System notifications over the XDG notifications D-Bus interface (notify-rust, zbus).
+notifications = ["dep:notify-rust"]
+a11y = ["dep:accesskit_unix"]
 
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 accesskit.workspace = true
-accesskit_unix.workspace = true
+accesskit_unix = { workspace = true, optional = true }
 anyhow.workspace = true
 bytemuck = "1"
 collections.workspace = true
@@ -75,13 +83,13 @@ strum.workspace = true
 url.workspace = true
 uuid.workspace = true
 
-# Always used
-oo7 = { version = "0.6", default-features = false, features = [
+# Used by the keyring feature only
+oo7 = { version = "0.6", default-features = false, optional = true, features = [
     "async-std",
     "native_crypto",
 ] }
 calloop = "0.14.3"
-notify-rust.workspace = true
+notify-rust = { workspace = true, optional = true }
 raw-window-handle.workspace = true
 
 # Used in both windowing options

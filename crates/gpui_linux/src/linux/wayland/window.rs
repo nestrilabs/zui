@@ -129,7 +129,7 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
-    accesskit_adapter: Option<accesskit_unix::Adapter>,
+    accesskit_adapter: Option<crate::linux::a11y::Adapter>,
 }
 
 pub enum WaylandSurfaceState {
@@ -1911,7 +1911,7 @@ impl PlatformWindow for WaylandWindow {
         };
 
         let adapter =
-            accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+            crate::linux::a11y::Adapter::new(activation_handler, action_handler, deactivation_handler);
 
         self.borrow_mut().accesskit_adapter = Some(adapter);
     }
