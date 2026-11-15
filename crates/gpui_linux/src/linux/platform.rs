@@ -7,11 +7,12 @@ use std::{
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use std::{
     ffi::OsString,
-    fs::File,
     io::Read as _,
-    os::fd::{AsFd, AsRawFd},
+    os::fd::AsRawFd,
     time::Duration,
 };
+#[cfg(all(feature = "portals", any(feature = "wayland", feature = "x11")))]
+use std::{fs::File, os::fd::AsFd};
 
 use anyhow::{Context as _, anyhow};
 use calloop::{LoopSignal, channel::Sender};
@@ -40,6 +41,7 @@ pub(crate) const SCROLL_LINES: f32 = 3.0;
 pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) const DOUBLE_CLICK_DISTANCE: Pixels = px(5.0);
+#[cfg(feature = "keyring")]
 pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -93,7 +95,7 @@ pub(crate) trait LinuxClient {
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
 
-    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[cfg(feature = "portals")]
     fn window_identifier(
         &self,
     ) -> impl Future<Output = Option<ashpd::WindowIdentifier>> + Send + 'static {
@@ -177,7 +179,7 @@ impl LinuxCommon {
 
     pub(crate) fn start_wake_listener(&mut self) {
         if !self.wake_listener_started {
-            #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+            #[cfg(all(target_os = "linux", feature = "portals"))]
             smol::spawn({
                 let wake_sender = self.wake_sender.clone();
                 async move {
@@ -200,7 +202,7 @@ impl LinuxCommon {
     }
 }
 
-#[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+#[cfg(all(target_os = "linux", feature = "portals"))]
 async fn listen_for_system_wake(wake_sender: Sender<()>) -> anyhow::Result<()> {
     use futures::StreamExt as _;
 
@@ -399,13 +401,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (done_tx, done_rx) = oneshot::channel();
 
-        #[cfg(not(any(feature = "wayland", feature = "x11")))]
-        let _ = (done_tx.send(Ok(None)), options);
+        #[cfg(not(feature = "portals"))]
+        let _ = (done_tx.send(Err(anyhow!(FILE_PICKER_PORTAL_MISSING))), options);
 
-        #[cfg(any(feature = "wayland", feature = "x11"))]
+        #[cfg(feature = "portals")]
         let identifier = self.inner.window_identifier();
 
-        #[cfg(any(feature = "wayland", feature = "x11"))]
+        #[cfg(feature = "portals")]
         self.foreground_executor()
             .spawn(async move {
                 let title = if options.directories {
@@ -460,13 +462,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (done_tx, done_rx) = oneshot::channel();
 
-        #[cfg(not(any(feature = "wayland", feature = "x11")))]
-        let _ = (done_tx.send(Ok(None)), directory, suggested_name);
+        #[cfg(not(feature = "portals"))]
+        let _ = (done_tx.send(Err(anyhow!(FILE_PICKER_PORTAL_MISSING))), directory, suggested_name);
 
-        #[cfg(any(feature = "wayland", feature = "x11"))]
+        #[cfg(feature = "portals")]
         let identifier = self.inner.window_identifier();
 
-        #[cfg(any(feature = "wayland", feature = "x11"))]
+        #[cfg(feature = "portals")]
         self.foreground_executor()
             .spawn({
                 let directory = directory.to_owned();
@@ -649,6 +651,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         self.inner.with_common(|common| common.auto_hide_scrollbars)
     }
 
+    #[cfg(feature = "keyring")]
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
         let url = url.to_string();
         let username = username.to_string();
@@ -668,6 +671,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         })
     }
 
+    #[cfg(feature = "keyring")]
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         let url = url.to_string();
         self.background_executor().spawn(async move {
@@ -696,6 +700,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         })
     }
 
+    #[cfg(feature = "keyring")]
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let url = url.to_string();
         self.background_executor().spawn(async move {
@@ -713,6 +718,21 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
             Ok(())
         })
+    }
+
+    #[cfg(not(feature = "keyring"))]
+    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!("credentials need the keyring feature, which this build leaves out")))
+    }
+
+    #[cfg(not(feature = "keyring"))]
+    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        Task::ready(Ok(None))
+    }
+
+    #[cfg(not(feature = "keyring"))]
+    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!("credentials need the keyring feature, which this build leaves out")))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
@@ -752,9 +772,10 @@ pub(super) fn open_uri_internal(
     uri: &str,
     activation_token: Option<String>,
 ) {
-    if let Some(uri) = ashpd::Uri::parse(uri).log_err() {
+    if let Some(uri) = url::Url::parse(uri).log_err() {
         executor
             .spawn(async move {
+                #[cfg_attr(not(feature = "portals"), allow(unused_assignments, unused_variables))]
                 let mut xdg_open_failed = false;
                 for mut command in open::commands(uri.to_string()) {
                     if let Some(token) = activation_token.as_ref() {
@@ -780,6 +801,7 @@ pub(super) fn open_uri_internal(
                     }
                 }
 
+                #[cfg(feature = "portals")]
                 if xdg_open_failed {
                     match ashpd::desktop::open_uri::OpenFileRequest::default()
                         .activation_token(activation_token.map(ashpd::ActivationToken::from))
@@ -807,6 +829,7 @@ pub(super) fn reveal_path_internal(
 ) {
     executor
         .spawn(async move {
+            #[cfg(feature = "portals")]
             if let Some(dir) = File::open(path.clone()).log_err() {
                 match ashpd::desktop::open_uri::OpenDirectoryRequest::default()
                     .activation_token(activation_token.map(ashpd::ActivationToken::from))
@@ -816,11 +839,13 @@ pub(super) fn reveal_path_internal(
                     Ok(_) => return,
                     Err(e) => log::error!("Failed to open with dbus: {}", e),
                 }
-                if path.is_dir() {
-                    open::that_detached(path).log_err();
-                } else {
-                    open::that_detached(path.parent().unwrap_or(Path::new(""))).log_err();
-                }
+            }
+            #[cfg(not(feature = "portals"))]
+            let _ = activation_token;
+            if path.is_dir() {
+                open::that_detached(path).log_err();
+            } else {
+                open::that_detached(path.parent().unwrap_or(Path::new(""))).log_err();
             }
         })
         .detach();

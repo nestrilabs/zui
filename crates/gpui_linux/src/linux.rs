@@ -2,6 +2,10 @@ mod dispatcher;
 mod headless;
 mod keyboard;
 mod platform;
+#[cfg(feature = "notifications")]
+mod system_notifications;
+#[cfg(not(feature = "notifications"))]
+#[path = "linux/system_notifications_off.rs"]
 mod system_notifications;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;
@@ -11,7 +15,10 @@ mod wayland;
 mod x11;
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(feature = "portals")]
 mod xdg_desktop_portal;
+
+mod a11y;
 
 pub use dispatcher::*;
 pub(crate) use headless::*;
