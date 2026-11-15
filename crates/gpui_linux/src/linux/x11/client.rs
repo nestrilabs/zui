@@ -59,10 +59,11 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, CustomCursorId, CustomCursorImage,
+    DisplayId, FileDropEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels,
+    PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
+    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams, point,
+    px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -213,6 +214,11 @@ pub struct X11ClientState {
     pub(crate) cursor_cache: HashMap<CursorStyle, Option<xproto::Cursor>>,
     pub(crate) invisible_cursor_cache: Option<xproto::Cursor>,
     pub(crate) cursor_hidden_window: Option<xproto::Window>,
+    /// Custom cursor images, made into X cursors (`CursorStyle::Custom`).
+    pub(crate) custom_cursors: HashMap<CustomCursorId, xproto::Cursor>,
+    /// The RENDER ARGB32 picture format, looked up on the first custom cursor. `Some(None)`:
+    /// the server has none, custom cursors show the arrow.
+    pub(crate) argb_format: Option<Option<render::Pictformat>>,
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
@@ -567,6 +573,8 @@ impl X11Client {
             cursor_cache: HashMap::default(),
             cursor_hidden_window: None,
             invisible_cursor_cache: None,
+            custom_cursors: HashMap::default(),
+            argb_format: None,
 
             pointer_device_states,
 
@@ -1704,6 +1712,7 @@ impl LinuxClient for X11Client {
         let Some(cursor) = state.get_cursor_icon(style) else {
             return;
         };
+        log_custom_applied(&state, style, focused_window);
 
         check_reply(
             || "Failed to set cursor style",
@@ -1717,6 +1726,10 @@ impl LinuxClient for X11Client {
         )
         .log_err();
         state.xcb_connection.flush().log_err();
+    }
+
+    fn set_custom_cursor(&self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        self.0.borrow_mut().set_custom_cursor(id, image);
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
@@ -2023,6 +2036,16 @@ impl X11ClientState {
     }
 
     fn get_cursor_icon(&mut self, style: CursorStyle) -> Option<xproto::Cursor> {
+        // Not theme cursors, and never in `cursor_cache`: a custom image can be replaced.
+        let style = match style {
+            CursorStyle::None => return self.get_or_create_invisible_cursor(),
+            CursorStyle::Custom(id) => match self.custom_cursors.get(&id) {
+                Some(cursor) => return Some(*cursor),
+                // No image held for the ID yet: the arrow until it comes.
+                None => CursorStyle::Arrow,
+            },
+            style => style,
+        };
         if let Some(cursor) = self.cursor_cache.get(&style) {
             return *cursor;
         }
@@ -2084,6 +2107,84 @@ impl X11ClientState {
 
         self.cursor_cache.insert(style, cursor);
         cursor
+    }
+
+    fn argb_format(&mut self) -> Option<render::Pictformat> {
+        if let Some(format) = self.argb_format {
+            return format;
+        }
+        let format = find_argb32_format(&self.xcb_connection)
+            .context("X11: no ARGB32 picture format, custom cursors show the arrow")
+            .log_err();
+        self.argb_format = Some(format);
+        format
+    }
+
+    /// Holds or forgets the custom cursor `id`, and shows the new one on every window whose style
+    /// is that cursor.
+    fn set_custom_cursor(&mut self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        let new = match image {
+            Some(image) => {
+                let Some(format) = self.argb_format() else {
+                    return;
+                };
+                let made = image.check().and_then(|()| {
+                    create_argb_cursor(&self.xcb_connection, self.x_root_index, format, &image)
+                });
+                match made {
+                    Ok(cursor) => {
+                        log::debug!(
+                            "X11: custom cursor {} held: {}x{} hotspot ({}, {})",
+                            id.0,
+                            image.width,
+                            image.height,
+                            image.hotspot_x,
+                            image.hotspot_y
+                        );
+                        Some(cursor)
+                    }
+                    Err(err) => {
+                        log::warn!("X11: custom cursor {} not made: {err:#}", id.0);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let old = match new {
+            Some(cursor) => self.custom_cursors.insert(id, cursor),
+            None => self.custom_cursors.remove(&id),
+        };
+        // The windows showing this cursor now show the new image (or the arrow).
+        let showing: Vec<xproto::Window> = self
+            .cursor_styles
+            .iter()
+            .filter(|(window, style)| {
+                **style == CursorStyle::Custom(id) && self.cursor_hidden_window != Some(**window)
+            })
+            .map(|(window, _)| *window)
+            .collect();
+        for window in showing {
+            let Some(cursor) = self.get_cursor_icon(CursorStyle::Custom(id)) else {
+                continue;
+            };
+            log_custom_applied(self, CursorStyle::Custom(id), window);
+            check_reply(
+                || "Failed to set custom cursor",
+                self.xcb_connection.change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux {
+                        cursor: Some(cursor),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .log_err();
+        }
+        if let Some(old) = old {
+            self.xcb_connection.free_cursor(old).log_err();
+        }
+        self.xcb_connection.flush().log_err();
     }
 
     fn get_or_create_invisible_cursor(&mut self) -> Option<xproto::Cursor> {
@@ -2527,6 +2628,113 @@ fn create_invisible_cursor(
 
     xcb_flush(connection);
     Ok(cursor)
+}
+
+/// Logs a custom or hidden cursor set on `window`, for proof in a log.
+fn log_custom_applied(state: &X11ClientState, style: CursorStyle, window: xproto::Window) {
+    match style {
+        CursorStyle::None => log::debug!("X11: hidden cursor set on window {window}"),
+        CursorStyle::Custom(id) => {
+            if state.custom_cursors.contains_key(&id) {
+                log::debug!("X11: custom cursor {} set on window {window}", id.0);
+            } else {
+                log::debug!(
+                    "X11: custom cursor {} not held yet, arrow set on window {window}",
+                    id.0
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The RENDER picture format for 32-bit ARGB with straight bit positions (PictStandardARGB32).
+fn find_argb32_format(connection: &XCBConnection) -> anyhow::Result<render::Pictformat> {
+    use render::ConnectionExt as _;
+    let formats = connection.render_query_pict_formats()?.reply()?;
+    formats
+        .formats
+        .iter()
+        .find(|f| {
+            let d = &f.direct;
+            f.type_ == render::PictType::DIRECT
+                && f.depth == 32
+                && d.alpha_shift == 24
+                && d.alpha_mask == 0xff
+                && d.red_shift == 16
+                && d.red_mask == 0xff
+                && d.green_shift == 8
+                && d.green_mask == 0xff
+                && d.blue_shift == 0
+                && d.blue_mask == 0xff
+        })
+        .map(|f| f.id)
+        .ok_or_else(|| anyhow!("no ARGB32 picture format"))
+}
+
+/// The image's pixels in the byte order of a 32-bit ZPixmap on this server: ARGB32 words.
+fn argb32_bytes(image: &CustomCursorImage, byte_order: xproto::ImageOrder) -> Vec<u8> {
+    let mut bytes = image.to_bgra_premultiplied();
+    if byte_order == xproto::ImageOrder::MSB_FIRST {
+        for px in bytes.chunks_exact_mut(4) {
+            px.reverse();
+        }
+    }
+    bytes
+}
+
+/// An X cursor from a custom image: a depth-32 pixmap, an ARGB32 picture on it, and a RENDER
+/// cursor from the picture.
+fn create_argb_cursor(
+    connection: &XCBConnection,
+    screen: usize,
+    format: render::Pictformat,
+    image: &CustomCursorImage,
+) -> anyhow::Result<xproto::Cursor> {
+    use render::ConnectionExt as _;
+    let width = u16::try_from(image.width).context("cursor too wide")?;
+    let height = u16::try_from(image.height).context("cursor too tall")?;
+    let root = connection.setup().roots[screen].root;
+    let bytes = argb32_bytes(image, connection.setup().image_byte_order);
+
+    let pixmap = connection.generate_id()?;
+    connection.create_pixmap(32, pixmap, root, width, height)?;
+    let gc = connection.generate_id()?;
+    connection.create_gc(gc, pixmap, &xproto::CreateGCAux::default())?;
+    let put = connection.put_image(
+        xproto::ImageFormat::Z_PIXMAP,
+        pixmap,
+        gc,
+        width,
+        height,
+        0,
+        0,
+        0,
+        32,
+        &bytes,
+    );
+    let picture = connection.generate_id()?;
+    let pictured = connection.render_create_picture(
+        picture,
+        pixmap,
+        format,
+        &render::CreatePictureAux::default(),
+    );
+    let cursor = connection.generate_id()?;
+    let made = connection.render_create_cursor(
+        cursor,
+        picture,
+        image.hotspot_x as u16,
+        image.hotspot_y as u16,
+    );
+    let result = check_reply(|| "put_image for a cursor failed", put)
+        .and_then(|()| check_reply(|| "create_picture for a cursor failed", pictured))
+        .and_then(|()| check_reply(|| "create_cursor failed", made));
+    connection.render_free_picture(picture).log_err();
+    connection.free_gc(gc).log_err();
+    connection.free_pixmap(pixmap).log_err();
+    xcb_flush(connection);
+    result.map(|()| cursor)
 }
 
 enum DpiMode {

@@ -45,14 +45,15 @@ use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
-    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
-    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    CustomCursorId, CustomCursorImage, DispatchPhase, DisplayId, EventEmitter, FocusHandle,
+    FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId,
+    Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
+    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
+    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -988,6 +989,12 @@ impl App {
     /// keyboard input.
     pub fn cursor_hide_mode(&self) -> CursorHideMode {
         self.cursor_hide_mode
+    }
+
+    /// Holds `image` as the custom cursor `id` (shown by `CursorStyle::Custom(id)`), or forgets
+    /// it when `image` is `None`. A window showing that cursor shows the new image at once.
+    pub fn set_custom_cursor(&self, id: CustomCursorId, image: Option<CustomCursorImage>) {
+        self.platform.set_custom_cursor(id, image);
     }
 
     /// Sets the policy controlling when GPUI hides the cursor in response

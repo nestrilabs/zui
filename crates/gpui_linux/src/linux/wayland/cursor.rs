@@ -91,6 +91,25 @@ impl Cursor {
         self.set_scaled_size(size);
     }
 
+    /// Shows a custom image, pixel for pixel (buffer scale 1).
+    pub fn set_custom(
+        &mut self,
+        wl_pointer: &WlPointer,
+        serial_id: u32,
+        custom: &super::client::CustomCursorBuffer,
+    ) {
+        self.surface.set_buffer_scale(1);
+        wl_pointer.set_cursor(
+            serial_id,
+            Some(&self.surface),
+            custom.hotspot_x,
+            custom.hotspot_y,
+        );
+        self.surface.attach(Some(&custom.buffer), 0, 0);
+        self.surface.damage(0, 0, custom.width, custom.height);
+        self.surface.commit();
+    }
+
     pub fn set_icon(
         &mut self,
         wl_pointer: &WlPointer,
