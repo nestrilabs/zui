@@ -226,7 +226,8 @@ pub struct X11ClientState {
     raw_relative: HashMap<xinput::DeviceId, bool>,
     /// The last raw motion taken: (source, time, delta).
     raw_last: Option<(xinput::DeviceId, u32, (f64, f64))>,
-    /// The server is Xwayland, which delivers each relative motion of a locked pointer twice.
+    /// The server is Xwayland (for logs).
+    #[allow(dead_code)]
     xwayland: bool,
 
     pub(crate) supports_xinput_gestures: bool,
@@ -1402,12 +1403,14 @@ impl X11Client {
                         log::trace!("X11: raw motion from absolute device {source} dropped");
                         return Some(());
                     }
-                    // Xwayland sends each relative motion of a locked pointer twice: the same
-                    // source, time and values. The second of such a pair is dropped.
+                    // While the client holds the grab, the server delivers each raw event to it
+                    // twice (the same source, time and values): an ungrabbed client selecting raw
+                    // motion on the root saw each once in the same run. The second of such a pair
+                    // is dropped.
                     let key = (source, event.time, delta);
-                    if state.xwayland && state.raw_last == Some(key) {
+                    if state.raw_last == Some(key) {
                         state.raw_last = None;
-                        log::trace!("X11: Xwayland duplicate raw motion dropped");
+                        log::trace!("X11: duplicate raw motion dropped");
                         return Some(());
                     }
                     state.raw_last = Some(key);
