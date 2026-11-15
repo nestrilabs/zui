@@ -2,16 +2,19 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, DrawOrder, GpuSpecs,
-    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, VideoColorMatrix,
+    VideoFrameTiming, VideoSourceId, get_gamma_correction_ratios, record_video_frame_timing,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -42,6 +45,144 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+/// One video quad for `shaders_video.wgsl` (`VideoInstance`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct VideoInstance {
+    quad: [f32; 4],
+    crop: [f32; 4],
+    clip: [f32; 4],
+    transform: [f32; 4],
+    extra: [f32; 4],
+    rgb_r: [f32; 4],
+    rgb_g: [f32; 4],
+    rgb_b: [f32; 4],
+}
+
+/// The persistent textures of one video source: luma (R8) and interleaved chroma (RG8) at half
+/// size. A new picture of the same size is written into them in place; only a size change makes
+/// new ones.
+struct GpuVideo {
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    generation: u64,
+    matrix: [[f32; 4]; 3],
+    last_used_frame: u64,
+}
+
+impl GpuVideo {
+    /// Textures for pictures of `width` x `height` (both even).
+    fn new(device: &wgpu::Device, width: u32, height: u32, frame: u64) -> Self {
+        let make = |label: &str, format: wgpu::TextureFormat, w: u32, h: u32| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let y = make("video_y", wgpu::TextureFormat::R8Unorm, width, height);
+        let uv = make(
+            "video_uv",
+            wgpu::TextureFormat::Rg8Unorm,
+            width / 2,
+            height / 2,
+        );
+        let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+        let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            y,
+            uv,
+            y_view,
+            uv_view,
+            width,
+            height,
+            generation: 0,
+            matrix: [[0.0; 4]; 3],
+            last_used_frame: frame,
+        }
+    }
+
+    /// Writes `picture` into the textures in place. Its size must be this one's (odd edges of
+    /// the picture are dropped).
+    fn write(&mut self, queue: &wgpu::Queue, picture: &gpui::VideoFrame) {
+        let (w, h) = (self.width, self.height);
+        let plane = |texture: &wgpu::Texture,
+                     data: &[u8],
+                     stride: u32,
+                     texels: u32,
+                     rows: u32,
+                     bpp: u32| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data[..(stride as usize) * (rows as usize - 1) + (texels * bpp) as usize],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(rows),
+                },
+                wgpu::Extent3d {
+                    width: texels,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        plane(&self.y, &picture.y, picture.y_stride, w, h, 1);
+        plane(&self.uv, &picture.uv, picture.uv_stride, w / 2, h / 2, 2);
+        self.matrix = video_rgb_matrix(picture.matrix, picture.full_range);
+    }
+}
+
+/// Video textures not drawn for this many frames are released.
+const VIDEO_RELEASE_AFTER_FRAMES: u64 = 300;
+
+/// Rows of the matrix taking sampled (y, cb, cr, 1), each in 0..1, to RGB.
+fn video_rgb_matrix(matrix: VideoColorMatrix, full_range: bool) -> [[f32; 4]; 3] {
+    let (kr, kb) = match matrix {
+        VideoColorMatrix::Bt709 => (0.2126f32, 0.0722f32),
+        VideoColorMatrix::Bt601 => (0.299, 0.114),
+    };
+    let kg = 1.0 - kr - kb;
+    let r_cr = 2.0 * (1.0 - kr);
+    let b_cb = 2.0 * (1.0 - kb);
+    let g_cb = -2.0 * kb * (1.0 - kb) / kg;
+    let g_cr = -2.0 * kr * (1.0 - kr) / kg;
+    let (ys, yo, cs) = if full_range {
+        (1.0, 0.0, 1.0)
+    } else {
+        (255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0)
+    };
+    // c' = cs * (c - 128 / 255): 8-bit chroma is centred on code 128, which samples as 128/255.
+    let center = 128.0 / 255.0;
+    let row = |c_cb: f32, c_cr: f32| {
+        [
+            ys,
+            c_cb * cs,
+            c_cr * cs,
+            -ys * yo - (c_cb + c_cr) * cs * center,
+        ]
+    };
+    [row(0.0, r_cr), row(g_cb, g_cr), row(b_cb, 0.0)]
 }
 
 #[repr(C)]
@@ -94,6 +235,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    video: wgpu::RenderPipeline,
     /// Separable gaussian (direction rides the uniform, so one pipeline
     /// serves both passes) rendering into a downsampled scratch texture.
     backdrop_blur_pass: wgpu::RenderPipeline,
@@ -106,6 +248,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    /// Video instances + luma texture + chroma texture + sampler.
+    video: wgpu::BindGroupLayout,
     /// Uniform + texture + sampler — shared by the backdrop-blur passes and
     /// the composite (each binds its own small uniform at an explicit offset).
     backdrop: wgpu::BindGroupLayout,
@@ -194,6 +338,8 @@ struct WgpuResources {
     // Some GL surfaces cannot be copied. Render into a copyable texture and
     // blit the completed frame to those surfaces when a backdrop is present.
     backdrop_frame: Option<(wgpu::Texture, wgpu::util::TextureBlitter)>,
+    video_sampler: wgpu::Sampler,
+    videos: HashMap<VideoSourceId, GpuVideo>,
 }
 
 impl WgpuResources {
@@ -243,6 +389,8 @@ pub struct WgpuRenderer {
     /// Byte stride between uniform slots in `backdrop_blur_params_buffer`
     /// (multiple of `min_uniform_buffer_offset_alignment`, >= 64).
     backdrop_slot_stride: u64,
+    /// Frames drawn, for releasing idle video textures.
+    frame_counter: u64,
 }
 
 impl WgpuRenderer {
@@ -493,6 +641,16 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
+        let video_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("video_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
             size: gamma_offset + gamma_size,
@@ -586,6 +744,8 @@ impl WgpuRenderer {
             backdrop_blur_sampler,
             backdrop_scratch: None,
             backdrop_frame: None,
+            video_sampler,
+            videos: HashMap::new(),
         };
 
         Ok(Self {
@@ -614,6 +774,7 @@ impl WgpuRenderer {
             blur_free_frames: 0,
             surface_supports_copy_src,
             backdrop_slot_stride,
+            frame_counter: 0,
         })
     }
 
@@ -733,6 +894,31 @@ impl WgpuRenderer {
             ],
         });
 
+        let video_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let video = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("video_layout"),
+            entries: &[
+                storage_buffer_entry(0),
+                video_texture_entry(1),
+                video_texture_entry(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         // Uniform + texture + sampler, shared by the separable blur passes
         // (BlurPassParams, 24B) and the composite (BackdropBlurParams, 64B).
         // No min_binding_size so one layout serves both uniform shapes.
@@ -773,6 +959,7 @@ impl WgpuRenderer {
             instances,
             instances_with_texture,
             surfaces,
+            video,
             backdrop,
         }
     }
@@ -1061,9 +1248,27 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(color_target.clone())],
             1,
             &shader_module,
+        );
+
+        let video_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpui_video_shaders"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shaders_video.wgsl"
+            ))),
+        });
+        let video = create_pipeline(
+            "video",
+            "vs_video",
+            "fs_video",
+            &layouts.globals,
+            &layouts.video,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &video_shader_module,
         );
 
         // Both backdrop pipelines draw without blending — the blur REPLACES
@@ -1108,6 +1313,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            video,
             backdrop_blur_pass,
             backdrop_composite,
         }
@@ -1715,6 +1921,8 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
+        let draw_started = Instant::now();
+        self.frame_counter += 1;
         self.atlas.before_frame();
 
         // Region-sized backdrop scratch is only worth holding while blurs
@@ -1730,6 +1938,7 @@ impl WgpuRenderer {
             self.blur_free_frames = 0;
         }
 
+        let acquire_started = Instant::now();
         let frame = match self.resources().surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -1760,8 +1969,14 @@ impl WgpuRenderer {
             }
         };
 
+        let acquire_us = acquire_started.elapsed().as_micros() as u32;
+
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
+
+        let upload_started = Instant::now();
+        let (video_quads, upload_bytes) = self.upload_videos(scene);
+        let upload_us = upload_started.elapsed().as_micros() as u32;
 
         let intermediate_frame =
             !self.surface_supports_copy_src && !scene.backdrop_blurs.is_empty();
@@ -1971,11 +2186,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                        PrimitiveBatch::Surfaces(range) => self.draw_videos(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -2014,8 +2229,173 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            if video_quads > 0 {
+                record_video_frame_timing(VideoFrameTiming {
+                    at: Some(draw_started),
+                    upload_us,
+                    upload_bytes,
+                    draw_us: draw_started.elapsed().as_micros() as u32,
+                    acquire_us,
+                    quads: video_quads,
+                });
+            }
             return true;
         }
+    }
+
+    /// Writes each drawn source's newest picture into its persistent textures, in place, when it
+    /// is newer than what they hold. Returns the number of video quads in the scene and the bytes
+    /// written.
+    fn upload_videos(&mut self, scene: &Scene) -> (u32, u32) {
+        let frame = self.frame_counter;
+        let resources = self
+            .resources
+            .as_mut()
+            .expect("GPU resources not available");
+        let mut quads = 0u32;
+        let mut bytes = 0u32;
+        for surface in &scene.surfaces {
+            let Some(video) = surface.video.as_ref() else {
+                continue;
+            };
+            quads += 1;
+            let id = video.source.id();
+            let seen = resources.videos.get(&id).map_or(0, |v| v.generation);
+            if let Some(gpu) = resources.videos.get_mut(&id) {
+                gpu.last_used_frame = frame;
+            }
+            let Some((generation, picture)) = video.source.frame_newer_than(seen) else {
+                continue;
+            };
+            let (w, h) = (picture.width & !1, picture.height & !1);
+            if w == 0
+                || h == 0
+                || picture.y.len() < (picture.y_stride as usize) * (h as usize)
+                || picture.uv.len() < (picture.uv_stride as usize) * (h as usize / 2)
+            {
+                log::warn!("video picture {w}x{h} has short planes; skipped");
+                continue;
+            }
+            let needs_new = resources
+                .videos
+                .get(&id)
+                .is_none_or(|v| v.width != w || v.height != h);
+            if needs_new {
+                resources
+                    .videos
+                    .insert(id, GpuVideo::new(&resources.device, w, h, frame));
+            }
+            let gpu = resources.videos.get_mut(&id).expect("inserted above");
+            gpu.write(&resources.queue, &picture);
+            bytes += w * h + w * (h / 2);
+            gpu.generation = generation;
+            video.source.mark_uploaded(generation);
+        }
+        if frame % 60 == 0 {
+            resources.videos.retain(|_, v| {
+                frame.saturating_sub(v.last_used_frame) < VIDEO_RELEASE_AFTER_FRAMES
+            });
+        }
+        (quads, bytes)
+    }
+
+    /// Draws a run of surfaces: each consecutive run on one video source is one instanced draw.
+    /// Surfaces without video (macOS-only pixel buffers) are skipped.
+    fn draw_videos(
+        &self,
+        surfaces: &[PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let resources = self.resources();
+        let mut start = 0;
+        while start < surfaces.len() {
+            let Some(first) = surfaces[start].video.as_ref() else {
+                start += 1;
+                continue;
+            };
+            let id = first.source.id();
+            let end = start
+                + 1
+                + surfaces[start + 1..]
+                    .iter()
+                    .take_while(|s| s.video.as_ref().is_some_and(|v| v.source.id() == id))
+                    .count();
+            let run = &surfaces[start..end];
+            start = end;
+            let Some(gpu) = resources.videos.get(&id) else {
+                continue;
+            };
+            let (tw, th) = (gpu.width as f32, gpu.height as f32);
+            let instances: Vec<VideoInstance> = run
+                .iter()
+                .filter_map(|surface| {
+                    let video = surface.video.as_ref()?;
+                    let crop = video.crop.map_or([0.0, 0.0, 1.0, 1.0], |c| {
+                        [
+                            c.origin.x / tw,
+                            c.origin.y / th,
+                            c.size.width / tw,
+                            c.size.height / th,
+                        ]
+                    });
+                    let q = video.quad_bounds;
+                    let m = surface.content_mask.bounds;
+                    Some(VideoInstance {
+                        quad: [q.origin.x.0, q.origin.y.0, q.size.width.0, q.size.height.0],
+                        crop,
+                        clip: [m.origin.x.0, m.origin.y.0, m.size.width.0, m.size.height.0],
+                        transform: [
+                            video.scale,
+                            video.rotate_y,
+                            video.perspective,
+                            video.corner_radius,
+                        ],
+                        extra: [video.translate.0, video.translate.1, video.opacity, 0.0],
+                        rgb_r: gpu.matrix[0],
+                        rgb_g: gpu.matrix[1],
+                        rgb_b: gpu.matrix[2],
+                    })
+                })
+                .collect();
+            if instances.is_empty() {
+                continue;
+            }
+            let Some((offset, size)) =
+                self.write_to_instance_buffer(instance_offset, bytemuck::cast_slice(&instances))
+            else {
+                return false;
+            };
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("video"),
+                    layout: &resources.bind_group_layouts.video,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.instance_binding(offset, size),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&gpu.y_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&gpu.uv_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.video_sampler),
+                        },
+                    ],
+                });
+            pass.set_pipeline(&resources.pipelines.video);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..instances.len() as u32);
+        }
+        true
     }
 
     fn draw_quads(
@@ -2732,6 +3112,10 @@ fn is_simple_solid_quad(quad: &Quad) -> bool {
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "solid_quad_tests.rs"]
 mod solid_quad_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "video_tests.rs"]
+mod video_tests;
 
 // Stay strictly inside the general shader's existing interior fast path. A
 // one-pixel guard excludes fractional border/corner coverage and fade ramps.
