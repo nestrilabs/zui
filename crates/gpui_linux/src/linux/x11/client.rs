@@ -221,6 +221,13 @@ pub struct X11ClientState {
     pub(crate) argb_format: Option<Option<render::Pictformat>>,
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
+    /// Whether each source device's x and y valuators are relative (a mouse) rather than
+    /// absolute (a tablet, Xwayland's absolute pointer), for raw motion.
+    raw_relative: HashMap<xinput::DeviceId, bool>,
+    /// The last raw motion taken: (source, time, delta).
+    raw_last: Option<(xinput::DeviceId, u32, (f64, f64))>,
+    /// The server is Xwayland, which delivers each relative motion of a locked pointer twice.
+    xwayland: bool,
 
     pub(crate) supports_xinput_gestures: bool,
 
@@ -380,6 +387,11 @@ impl X11Client {
 
         let pointer_device_states =
             current_pointer_device_states(&xcb_connection, &BTreeMap::new()).unwrap_or_default();
+        let xwayland = xcb_connection
+            .query_extension(b"XWAYLAND")
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.present);
 
         let atoms = XcbAtoms::new(&xcb_connection)
             .context("Failed to get XCB atoms")?
@@ -577,6 +589,9 @@ impl X11Client {
             argb_format: None,
 
             pointer_device_states,
+            raw_relative: HashMap::default(),
+            raw_last: None,
+            xwayland,
 
             supports_xinput_gestures,
 
@@ -1362,8 +1377,40 @@ impl X11Client {
                         _ => {}
                     }
                 }
+                log::trace!(
+                    "X11: raw motion device {} source {} time {} delta {delta:?}",
+                    event.deviceid,
+                    event.sourceid,
+                    event.time
+                );
                 if delta == (0.0, 0.0) {
                     return Some(());
+                }
+                {
+                    let mut state = self.0.borrow_mut();
+                    let source = event.sourceid;
+                    let relative = match state.raw_relative.get(&source) {
+                        Some(r) => *r,
+                        None => {
+                            let r = source_is_relative(&state.xcb_connection, source);
+                            state.raw_relative.insert(source, r);
+                            r
+                        }
+                    };
+                    // An absolute device's raw values are positions, not motion.
+                    if !relative {
+                        log::trace!("X11: raw motion from absolute device {source} dropped");
+                        return Some(());
+                    }
+                    // Xwayland sends each relative motion of a locked pointer twice: the same
+                    // source, time and values. The second of such a pair is dropped.
+                    let key = (source, event.time, delta);
+                    if state.xwayland && state.raw_last == Some(key) {
+                        state.raw_last = None;
+                        log::trace!("X11: Xwayland duplicate raw motion dropped");
+                        return Some(());
+                    }
+                    state.raw_last = Some(key);
                 }
                 let window = {
                     let state = self.0.borrow();
@@ -3373,4 +3420,21 @@ mod tests {
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
     }
+}
+
+/// Whether the x and y valuators of XInput device `id` are relative (a mouse). A device that
+/// cannot be asked is taken as relative.
+fn source_is_relative(xcb: &XCBConnection, id: xinput::DeviceId) -> bool {
+    let Ok(reply) = xcb.xinput_xi_query_device(id).map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())) else {
+        return true;
+    };
+    reply
+        .infos
+        .iter()
+        .flat_map(|info| info.classes.iter())
+        .filter_map(|class| match &class.data {
+            xinput::DeviceClassData::Valuator(v) if v.number <= 1 => Some(v.mode),
+            _ => None,
+        })
+        .all(|mode| mode == xinput::ValuatorMode::RELATIVE)
 }
