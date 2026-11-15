@@ -101,23 +101,7 @@ http = "1.1"
 http-body = "1.0"
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
-image = { version = "0.25.1", default-features = false, features = [
-    "bmp",
-    "dds",
-    "exr",
-    "ff",
-    "gif",
-    "hdr",
-    "ico",
-    "jpeg",
-    "png",
-    "pnm",
-    "qoi",
-    "rayon",
-    "tga",
-    "tiff",
-    "webp",
-] }
+image = { version = "0.25.1", default-features = false, features = ["png"] }
 indexmap = { version = "2.7.0", features = ["serde"] }
 inventory = "0.3.19"
 itertools = "0.14.0"
@@ -237,7 +221,7 @@ uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
 walkdir = "2.5"
 wasm-bindgen = "0.2.120"
 web-time = "1.1.0"
-wgpu = "29.0.4"
+wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 which = "6.0.0"
 windows-core = "0.61"
 
