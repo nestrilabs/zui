@@ -280,6 +280,8 @@ pub struct X11WindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     fullscreen: bool,
+    /// The pointer grab this window holds (`set_pointer_grab`).
+    pub(crate) pointer_grab: gpui::PointerGrab,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
@@ -797,6 +799,7 @@ impl X11WindowState {
                 hovered: false,
                 force_render_after_recovery: false,
                 fullscreen: false,
+                pointer_grab: gpui::PointerGrab::None,
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
@@ -1655,6 +1658,68 @@ impl PlatformWindow for X11Window {
 
     fn is_fullscreen(&self) -> bool {
         self.0.state.borrow().fullscreen
+    }
+
+    /// As winit grabs on X11: an active pointer grab with the window as `confine_to`, so the
+    /// cursor cannot leave it, and events inside it still reach the window's own (XInput 2)
+    /// selections (`owner_events`). `Locked` also selects XInput 2 raw motion on the root window:
+    /// raw events reach the client whatever the grab and the cursor do, and the client sends them
+    /// to the window as `MouseRawMotion`. Raw motion is only read for the master pointer, so each
+    /// physical motion arrives once.
+    fn set_pointer_grab(&self, grab: gpui::PointerGrab) -> anyhow::Result<()> {
+        let xcb = &self.0.xcb;
+        let x_window = self.0.x_window;
+        let root = self.0.state.borrow().x_root_window;
+        let raw = |on: bool| -> anyhow::Result<()> {
+            let mask = if on {
+                xinput::XIEventMask::RAW_MOTION
+            } else {
+                xinput::XIEventMask::from(0u32)
+            };
+            check_reply(
+                || "X11 XiSelectEvents for raw motion failed.",
+                xcb.xinput_xi_select_events(
+                    root,
+                    &[xinput::EventMask {
+                        deviceid: XINPUT_ALL_DEVICE_GROUPS,
+                        mask: vec![mask],
+                    }],
+                ),
+            )
+        };
+        match grab {
+            gpui::PointerGrab::None => {
+                xcb.ungrab_pointer(x11rb::CURRENT_TIME)?;
+                raw(false)?;
+                log::debug!("X11: pointer grab released on window {x_window}");
+            }
+            gpui::PointerGrab::Confined | gpui::PointerGrab::Locked => {
+                let reply = xcb
+                    .grab_pointer(
+                        true,
+                        x_window,
+                        xproto::EventMask::BUTTON_PRESS
+                            | xproto::EventMask::BUTTON_RELEASE
+                            | xproto::EventMask::ENTER_WINDOW
+                            | xproto::EventMask::LEAVE_WINDOW
+                            | xproto::EventMask::POINTER_MOTION,
+                        xproto::GrabMode::ASYNC,
+                        xproto::GrabMode::ASYNC,
+                        x_window,
+                        x11rb::NONE,
+                        x11rb::CURRENT_TIME,
+                    )?
+                    .reply()?;
+                if reply.status != xproto::GrabStatus::SUCCESS {
+                    anyhow::bail!("X11 GrabPointer refused: {:?}", reply.status);
+                }
+                raw(grab == gpui::PointerGrab::Locked)?;
+                log::debug!("X11: pointer grab {grab:?} set on window {x_window}");
+            }
+        }
+        xcb.flush()?;
+        self.0.state.borrow_mut().pointer_grab = grab;
+        Ok(())
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

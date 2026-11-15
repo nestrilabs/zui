@@ -52,6 +52,12 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -204,6 +210,9 @@ pub struct Globals {
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
     pub cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    pub pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
+    pub relative_pointer_manager:
+        Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     pub data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     pub primary_selection_manager:
         Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
@@ -242,6 +251,8 @@ impl Globals {
                 )
                 .unwrap(),
             cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            pointer_constraints: globals.bind(&qh, 1..=1, ()).ok(),
+            relative_pointer_manager: globals.bind(&qh, 1..=1, ()).ok(),
             data_device_manager: globals
                 .bind(
                     &qh,
@@ -343,6 +354,10 @@ pub(crate) struct WaylandClientState {
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
+    /// The pointer grab a window holds (`set_pointer_grab`): its surface and the constraint.
+    pointer_grab: Option<(ObjectId, PointerConstraint)>,
+    /// Relative motion for a locked grab, from `zwp_relative_pointer_v1`.
+    relative_pointer: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
@@ -953,6 +968,8 @@ impl WaylandClient {
             horizontal_modifier: -1.0,
             button_pressed: None,
             mouse_focused_window: None,
+            pointer_grab: None,
+            relative_pointer: None,
             keyboard_focused_window: None,
             loop_handle: handle.clone(),
             enter_token: None,
@@ -1412,6 +1429,142 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
+
+/// A pointer constraint a window holds.
+pub(crate) enum PointerConstraint {
+    Confined(zwp_confined_pointer_v1::ZwpConfinedPointerV1),
+    Locked(zwp_locked_pointer_v1::ZwpLockedPointerV1),
+}
+
+impl PointerConstraint {
+    fn destroy(&self) {
+        match self {
+            PointerConstraint::Confined(c) => c.destroy(),
+            PointerConstraint::Locked(l) => l.destroy(),
+        }
+    }
+}
+
+impl WaylandClientStatePtr {
+    /// Holds the pointer for the window of `surface` (`Window::set_pointer_grab`): a persistent
+    /// `zwp_pointer_constraints_v1` confinement or lock, which the compositor applies while the
+    /// pointer is over the surface and again each time it comes back. A lock also reads
+    /// `zwp_relative_pointer_v1` relative motion, sent to the window as `MouseRawMotion`.
+    pub(crate) fn set_pointer_grab(
+        &self,
+        surface: &wl_surface::WlSurface,
+        grab: gpui::PointerGrab,
+    ) -> anyhow::Result<()> {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if let Some((_, old)) = state.pointer_grab.take() {
+            old.destroy();
+        }
+        if let Some(relative) = state.relative_pointer.take() {
+            relative.destroy();
+        }
+        if grab == gpui::PointerGrab::None {
+            log::debug!("wayland: pointer grab released");
+            return Ok(());
+        }
+        let qh = state.globals.qh.clone();
+        let Some(pointer) = state.wl_pointer.clone() else {
+            anyhow::bail!("wayland: no pointer to grab");
+        };
+        let Some(constraints) = state.globals.pointer_constraints.clone() else {
+            anyhow::bail!("wayland: the compositor has no zwp_pointer_constraints_v1");
+        };
+        use zwp_pointer_constraints_v1::Lifetime;
+        let constraint = match grab {
+            gpui::PointerGrab::Locked => {
+                let Some(manager) = state.globals.relative_pointer_manager.clone() else {
+                    anyhow::bail!("wayland: the compositor has no zwp_relative_pointer_manager_v1");
+                };
+                state.relative_pointer = Some(manager.get_relative_pointer(&pointer, &qh, ()));
+                PointerConstraint::Locked(constraints.lock_pointer(
+                    surface,
+                    &pointer,
+                    None,
+                    Lifetime::Persistent,
+                    &qh,
+                    (),
+                ))
+            }
+            _ => PointerConstraint::Confined(constraints.confine_pointer(
+                surface,
+                &pointer,
+                None,
+                Lifetime::Persistent,
+                &qh,
+                (),
+            )),
+        };
+        state.pointer_grab = Some((surface.id(), constraint));
+        log::debug!("wayland: pointer grab {grab:?} set");
+        Ok(())
+    }
+}
+
+impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        event: zwp_locked_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        log::debug!("wayland: locked pointer {event:?}");
+    }
+}
+
+impl Dispatch<zwp_confined_pointer_v1::ZwpConfinedPointerV1, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        event: zwp_confined_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        log::debug!("wayland: confined pointer {event:?}");
+    }
+}
+
+impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: zwp_relative_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let zwp_relative_pointer_v1::Event::RelativeMotion {
+            dx_unaccel,
+            dy_unaccel,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let client = this.get_client();
+        let window = {
+            let mut state = client.borrow_mut();
+            let Some(id) = state.pointer_grab.as_ref().map(|(id, _)| id.clone()) else {
+                return;
+            };
+            get_window(&mut state, &id)
+        };
+        if let Some(window) = window {
+            window.handle_input(PlatformInput::MouseRawMotion(gpui::MouseRawMotionEvent {
+                delta: point(dx_unaccel, dy_unaccel),
+            }));
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(

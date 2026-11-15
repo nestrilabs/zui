@@ -757,7 +757,28 @@ pub enum PlatformInput {
     FileDrop(FileDropEvent),
     /// A raw touch event on a touch screen.
     Touch(TouchEvent),
+    /// Motion of the pointing device while the window grabs the pointer.
+    MouseRawMotion(MouseRawMotionEvent),
 }
+
+/// Motion of the pointing device itself, read while the window grabs the pointer
+/// (`Window::set_pointer_grab`): how far the mouse moved, in device units (unaccelerated where the
+/// platform gives that), whatever the cursor did. Only sent to a window that holds a grab, so a
+/// game streamed into the window can take relative motion while the cursor stays put.
+#[derive(Clone, Debug, Default)]
+pub struct MouseRawMotionEvent {
+    /// The motion since the last event, device units, right and down positive.
+    pub delta: Point<f64>,
+}
+
+impl Sealed for MouseRawMotionEvent {}
+impl InputEvent for MouseRawMotionEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::MouseRawMotion(self)
+    }
+}
+
+impl MouseEvent for MouseRawMotionEvent {}
 
 impl PlatformInput {
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
@@ -773,6 +794,7 @@ impl PlatformInput {
             PlatformInput::ScrollWheel(event) => Some(event),
             PlatformInput::Pinch(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
+            PlatformInput::MouseRawMotion(event) => Some(event),
             PlatformInput::Touch(_) => None,
         }
     }
@@ -790,6 +812,7 @@ impl PlatformInput {
             PlatformInput::ScrollWheel(_) => None,
             PlatformInput::Pinch(_) => None,
             PlatformInput::FileDrop(_) => None,
+            PlatformInput::MouseRawMotion(_) => None,
             PlatformInput::Touch(_) => None,
         }
     }

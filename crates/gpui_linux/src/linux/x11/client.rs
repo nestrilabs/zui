@@ -1345,6 +1345,41 @@ impl X11Client {
                 }));
                 window.set_hovered(false);
             }
+            Event::XinputRawMotion(event) => {
+                // Raw motion is selected only while a window holds a locked grab
+                // (`X11Window::set_pointer_grab`); it goes to that window.
+                let mut delta = (0.0f64, 0.0f64);
+                let mut values = event.axisvalues_raw.iter();
+                for axis in 0..(event.valuator_mask.len() * 32) {
+                    if event.valuator_mask[axis / 32] & (1 << (axis % 32)) == 0 {
+                        continue;
+                    }
+                    let Some(v) = values.next() else { break };
+                    let v = f64::from(v.integral) + f64::from(v.frac) / 4_294_967_296.0;
+                    match axis {
+                        0 => delta.0 = v,
+                        1 => delta.1 = v,
+                        _ => {}
+                    }
+                }
+                if delta == (0.0, 0.0) {
+                    return Some(());
+                }
+                let window = {
+                    let state = self.0.borrow();
+                    state
+                        .windows
+                        .values()
+                        .map(|r| r.window.clone())
+                        .find(|w| {
+                            let s = w.state.borrow();
+                            !s.destroyed && s.pointer_grab == gpui::PointerGrab::Locked
+                        })
+                }?;
+                window.handle_input(PlatformInput::MouseRawMotion(gpui::MouseRawMotionEvent {
+                    delta: point(delta.0, delta.1),
+                }));
+            }
             Event::XinputHierarchy(event) => {
                 let mut state = self.0.borrow_mut();
                 // Temporarily use `state.pointer_device_states` to only store pointers that still have valid scroll values.

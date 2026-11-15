@@ -5253,6 +5253,7 @@ impl Window {
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
+            PlatformInput::MouseRawMotion(motion) => PlatformInput::MouseRawMotion(motion),
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
@@ -5807,6 +5808,16 @@ impl Window {
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();
+    }
+
+    /// Grabs the pointer for this window, or lets it go with `PointerGrab::None`. `Confined` keeps
+    /// the cursor inside the window; `Locked` also keeps it still and sends the device's own motion
+    /// as `MouseRawMotionEvent`s, for relative-motion input (a game). The cursor's shape is
+    /// unchanged: hide it with `CursorStyle::None`. Fails where the platform has no such grab or
+    /// refuses it now (another client holds the pointer, the window is not focused); try again
+    /// later. X11 and Wayland only.
+    pub fn set_pointer_grab(&self, grab: crate::PointerGrab) -> anyhow::Result<()> {
+        self.platform_window.set_pointer_grab(grab)
     }
 
     /// Updates the IME panel position suggestions for languages like japanese, chinese.

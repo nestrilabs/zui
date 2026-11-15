@@ -795,6 +795,19 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// How a window holds the pointer (`Window::set_pointer_grab`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PointerGrab {
+    /// No grab: the pointer moves freely.
+    #[default]
+    None,
+    /// The cursor cannot leave the window.
+    Confined,
+    /// The cursor stays where it is and the window gets the device's motion as
+    /// `MouseRawMotionEvent`s.
+    Locked,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -829,6 +842,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
+    /// See `Window::set_pointer_grab`.
+    fn set_pointer_grab(&self, grab: PointerGrab) -> anyhow::Result<()> {
+        if grab == PointerGrab::None {
+            Ok(())
+        } else {
+            anyhow::bail!("pointer grabs are not supported on this platform")
+        }
+    }
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     /// Optional demand gate for platforms with a continuously running display
     /// clock. The callback only arms future delivery; it must not invoke the

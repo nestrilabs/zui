@@ -1629,6 +1629,14 @@ impl PlatformWindow for WaylandWindow {
             .is_some_and(|ctx| ctx.supports_dual_source_blending())
     }
 
+    fn set_pointer_grab(&self, grab: gpui::PointerGrab) -> anyhow::Result<()> {
+        let (client, surface) = {
+            let state = self.borrow();
+            (state.client.clone(), state.surface.clone())
+        };
+        client.set_pointer_grab(&surface, grab)
+    }
+
     fn minimize(&self) {
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_minimized();
