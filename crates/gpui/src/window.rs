@@ -4699,8 +4699,6 @@ impl Window {
         source: &std::sync::Arc<crate::VideoSource>,
         params: crate::VideoParams,
     ) {
-        use crate::{PaintSurface, VideoQuad};
-
         self.invalidator.debug_assert_paint();
         #[cfg(target_os = "macos")]
         {
@@ -4709,6 +4707,8 @@ impl Window {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            use crate::{PaintSurface, VideoQuad};
+
             if source.size().is_none() {
                 return;
             }
